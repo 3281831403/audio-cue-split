@@ -33,8 +33,35 @@ ILLEGAL_FILENAME_CHARS = frozenset('<>:"/\\|?*')
 """Windows 文件名中不允许出现的字符；路径分隔符也在其中。"""
 
 
+_TRACK_RE = re.compile(r"^\s*TRACK\s+(\d+)\b", re.IGNORECASE)
+_TITLE_RE = re.compile(r'^\s*TITLE\s+"(.*)"\s*$', re.IGNORECASE)
+_INDEX_RE = re.compile(r"^\s*INDEX\s+(\d+)\s+(\S+)\s*$", re.IGNORECASE)
+_TIMECODE_RE = re.compile(r"^(\d{2,}):(\d{2}):(\d{2})$")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
 class CueError(ValueError):
     """CUE 文本、时间码、轨规划或批量输入非法时抛出的异常。"""
+
+
+def _require_int(value, name: str, *, minimum: int | None = None) -> int:
+    """校验整数参数（布尔值不算整数），可选下界。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CueError(f"{name} 必须是整数")
+    if minimum is not None and value < minimum:
+        raise CueError(f"{name} 必须不小于 {minimum}")
+    return value
+
+
+def _require_track(track, key: str):
+    """取轨字典中的字段，缺失或类型错误时统一抛 :class:`CueError`。"""
+
+    if not isinstance(track, dict):
+        raise CueError("轨必须是字典")
+    if key not in track:
+        raise CueError(f"轨缺少字段 {key}")
+    return track[key]
 
 
 def parse_cue(text: list[str]) -> list[dict]:
@@ -54,7 +81,59 @@ def parse_cue(text: list[str]) -> list[dict]:
     * 本函数只解析文本，不把时间码换算成帧，也不修改 ``text``。
     """
 
-    raise NotImplementedError("parse_cue 尚未实现")
+    if not isinstance(text, (list, tuple)):
+        raise CueError("CUE 文本必须是行列表")
+
+    tracks: list[dict] = []
+    seen_numbers: set[int] = set()
+    current: dict | None = None
+
+    for raw_line in text:
+        if not isinstance(raw_line, str):
+            raise CueError("CUE 文本的每一行都必须是字符串")
+
+        match = _TRACK_RE.match(raw_line)
+        if match:
+            number = int(match.group(1))
+            if number in seen_numbers:
+                raise CueError(f"轨号重复：{number}")
+            seen_numbers.add(number)
+            # 每条轨独立持有自己的状态，绝不复用上一轨的字段。
+            current = {"number": number, "title": None, "start": None}
+            tracks.append(current)
+            continue
+
+        match = _TITLE_RE.match(raw_line)
+        if match:
+            # 轨级 TITLE 生效；专辑级 TITLE（首个 TRACK 之前）忽略。
+            if current is not None and current["title"] is None:
+                current["title"] = match.group(1)
+            continue
+
+        match = _INDEX_RE.match(raw_line)
+        if match:
+            index_number = int(match.group(1))
+            # 只认 INDEX 01；INDEX 00（前奏索引）等一律忽略。
+            if (
+                index_number == 1
+                and current is not None
+                and current["start"] is None
+            ):
+                current["start"] = match.group(2)
+            continue
+
+        # FILE、REM 等其他行忽略。
+
+    if not tracks:
+        raise CueError("CUE 中没有任何 TRACK")
+
+    for track in tracks:
+        if track["start"] is None:
+            raise CueError(f"轨 {track['number']} 缺少 INDEX 01")
+        if track["title"] is None:
+            track["title"] = f"Track {track['number']:02d}"
+
+    return tracks
 
 
 def timecode_to_frames(tc: str, fps: int) -> int:
@@ -72,7 +151,25 @@ def timecode_to_frames(tc: str, fps: int) -> int:
       ``fps`` 决定，绝不固定按 75 帧/秒解析。结果允许 1 帧误差。
     """
 
-    raise NotImplementedError("timecode_to_frames 尚未实现")
+    fps = _require_int(fps, "fps", minimum=1)
+    if not isinstance(tc, str):
+        raise CueError("时间码必须是字符串")
+
+    match = _TIMECODE_RE.match(tc)
+    if not match:
+        raise CueError(f"非法时间码：{tc!r}")
+
+    minutes = int(match.group(1))
+    seconds = int(match.group(2))
+    frames = int(match.group(3))
+
+    if seconds > 59:
+        raise CueError(f"非法时间码秒字段：{tc!r}")
+    # FF 必须落在 0..fps-1；溢出时不能静默进位到秒或分钟。
+    if frames >= fps:
+        raise CueError(f"帧字段 {frames} 超出帧率 {fps}：{tc!r}")
+
+    return (minutes * 60 + seconds) * fps + frames
 
 
 def plan_tracks(tracks: list[dict], total_frames: int) -> list[dict]:
@@ -91,7 +188,35 @@ def plan_tracks(tracks: list[dict], total_frames: int) -> list[dict]:
     * ``tracks`` 为空时返回 ``[]``；不得修改输入。
     """
 
-    raise NotImplementedError("plan_tracks 尚未实现")
+    total_frames = _require_int(total_frames, "total_frames", minimum=0)
+    if not isinstance(tracks, (list, tuple)):
+        raise CueError("tracks 必须是列表")
+
+    starts: list[int] = []
+    for track in tracks:
+        start = _require_track(track, "start_frame")
+        start = _require_int(start, "start_frame", minimum=0)
+        if start > total_frames:
+            raise CueError(f"轨 {track.get('number')} 起点 {start} 超出总长 {total_frames}")
+        starts.append(start)
+
+    for previous, current in zip(starts, starts[1:]):
+        if current < previous:
+            raise CueError("轨起点必须单调不降")
+
+    planned: list[dict] = []
+    for index, track in enumerate(tracks):
+        # 复制轨字典，保留原有字段；不修改输入。
+        planned_track = dict(track)
+        planned_track["start_frame"] = starts[index]
+        # 除最后一轨外，结束于下一轨起点；最后一轨必须覆盖到片尾。
+        if index + 1 < len(starts):
+            planned_track["end_frame"] = starts[index + 1]
+        else:
+            planned_track["end_frame"] = total_frames
+        planned.append(planned_track)
+
+    return planned
 
 
 def apply_gap(tracks: list[dict], gap_frames: int) -> list[dict]:
@@ -112,7 +237,34 @@ def apply_gap(tracks: list[dict], gap_frames: int) -> list[dict]:
     * 不修改输入；``tracks`` 为空时返回 ``[]``。
     """
 
-    raise NotImplementedError("apply_gap 尚未实现")
+    gap_frames = _require_int(gap_frames, "gap_frames", minimum=0)
+    if not isinstance(tracks, (list, tuple)):
+        raise CueError("tracks 必须是列表")
+    if not tracks:
+        return []
+
+    gapped: list[dict] = []
+    for index, track in enumerate(tracks):
+        start = _require_int(
+            _require_track(track, "start_frame"), "start_frame", minimum=0
+        )
+        end = _require_int(
+            _require_track(track, "end_frame"), "end_frame", minimum=0
+        )
+        gapped_track = dict(track)
+
+        if index + 1 < len(tracks):
+            # 非末轨从自己的尾部让出完整间隙，后一轨起点不动。
+            if end - start < gap_frames:
+                raise CueError(
+                    f"轨 {track.get('number')} 时长不足以让出 {gap_frames} 帧间隙"
+                )
+            gapped_track["end_frame"] = end - gap_frames
+        # 末轨 end 不变；所有 start 均不变，因此总跨度保持不变。
+        gapped_track["start_frame"] = start
+        gapped.append(gapped_track)
+
+    return gapped
 
 
 def sanitize_name(title: str, index: int) -> str:
@@ -132,7 +284,29 @@ def sanitize_name(title: str, index: int) -> str:
     * 返回值是纯文件名主干，不含目录，也不访问文件系统。
     """
 
-    raise NotImplementedError("sanitize_name 尚未实现")
+    index = _require_int(index, "index", minimum=1)
+    if not isinstance(title, str):
+        raise CueError("title 必须是字符串")
+
+    # 删除 Windows 非法字符（含 / 与 \，阻断路径逃逸）与 ASCII 控制字符。
+    cleaned_chars = []
+    for char in title:
+        if char in ILLEGAL_FILENAME_CHARS:
+            continue
+        code = ord(char)
+        if code < 32 or code == 127:
+            continue
+        cleaned_chars.append(char)
+    cleaned = "".join(cleaned_chars)
+
+    # 连续空白折叠为单个半角空格，并去掉首尾的空格与点，
+    # 避免隐藏文件或残留 ".." 路径片段。
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip(" .")
+
+    if not cleaned:
+        cleaned = "Track"
+
+    return f"{index:02d} - {cleaned}"
 
 
 def detect_pregap(tracks: list[dict], audio: list[int]) -> list[int]:
@@ -153,7 +327,45 @@ def detect_pregap(tracks: list[dict], audio: list[int]) -> list[int]:
     * 轨边界越出 ``audio`` 范围时抛 :class:`CueError`；不修改输入。
     """
 
-    raise NotImplementedError("detect_pregap 尚未实现")
+    if not isinstance(audio, (list, tuple)):
+        raise CueError("audio 必须是采样点序列")
+    if not isinstance(tracks, (list, tuple)):
+        raise CueError("tracks 必须是列表")
+
+    offsets: list[int] = []
+    audio_len = len(audio)
+
+    for track in tracks:
+        start = _require_int(
+            _require_track(track, "start_frame"), "start_frame", minimum=0
+        )
+        end = _require_int(
+            _require_track(track, "end_frame"), "end_frame", minimum=0
+        )
+        if end < start:
+            raise CueError("轨结束早于起点")
+        if end > audio_len:
+            raise CueError(
+                f"轨区间 [{start}, {end}) 越出音频范围 {audio_len}"
+            )
+
+        segment = audio[start:end]
+        # 自适应阈值：按本轨峰值缩放，轻声轨不会漏检、大声轨不会误检。
+        peak = 0
+        for sample in segment:
+            magnitude = abs(sample)
+            if magnitude > peak:
+                peak = magnitude
+        threshold = max(1, peak * 0.02)
+
+        offset = 0
+        for sample in segment:
+            if abs(sample) > threshold:
+                break
+            offset += 1
+        offsets.append(offset)
+
+    return offsets
 
 
 def validate_tracks(tracks: list[dict], total_frames: int) -> list[str]:
@@ -173,7 +385,37 @@ def validate_tracks(tracks: list[dict], total_frames: int) -> list[str]:
       不修改输入，也不从列表里静默删除任何轨。
     """
 
-    raise NotImplementedError("validate_tracks 尚未实现")
+    total_frames = _require_int(total_frames, "total_frames", minimum=0)
+    if not isinstance(tracks, (list, tuple)):
+        raise CueError("tracks 必须是列表")
+
+    issues: list[str] = []
+    previous_end: int | None = None
+
+    for track in tracks:
+        number = track.get("number") if isinstance(track, dict) else None
+        start = _require_int(
+            _require_track(track, "start_frame"), "start_frame"
+        )
+        end = _require_int(_require_track(track, "end_frame"), "end_frame")
+
+        # 越界：起止任一超出 [0, total_frames]。
+        if start < 0 or start > total_frames or end > total_frames:
+            issues.append(
+                f"轨 {number} 越界：[{start}, {end}) 不在 [0, {total_frames}] 内"
+            )
+
+        # 零时长或反向时长：会导出空文件。
+        if end <= start:
+            issues.append(f"轨 {number} 时长非法：{end - start} 帧")
+
+        # 重叠：本轨起点早于前一轨结束，导出后会重复同一段音频。
+        if previous_end is not None and start < previous_end:
+            issues.append(f"轨 {number} 与前一轨重叠：起点 {start} < 前一轨结束 {previous_end}")
+
+        previous_end = end
+
+    return issues
 
 
 def split_batch(
@@ -217,4 +459,56 @@ def split_batch(
       修改。批量全部成功时，各 CUE 的轨列表必须是彼此独立的对象。
     """
 
-    raise NotImplementedError("split_batch 尚未实现")
+    audio_len = _require_int(audio_len, "audio_len", minimum=1)
+    fps = _require_int(fps, "fps", minimum=1)
+    if not isinstance(cues, (list, tuple)):
+        raise CueError("cues 必须是列表")
+
+    entries: list[dict] = []
+    batch_track_count = 0
+
+    for cue_index, cue in enumerate(cues):
+        # 每份 CUE 都从零开始，构建全新的轨列表，绝不复用其它 CUE 的状态。
+        parsed = parse_cue(cue)
+        normalized = [
+            {
+                "number": track["number"],
+                "title": track["title"],
+                "start_frame": timecode_to_frames(track["start"], fps),
+            }
+            for track in parsed
+        ]
+        planned = plan_tracks(normalized, audio_len)
+
+        issues = validate_tracks(planned, audio_len)
+        if issues:
+            raise CueError(
+                f"第 {cue_index + 1} 份 CUE 轨结构非法：" + "；".join(issues)
+            )
+
+        tracks = [
+            {
+                "number": track["number"],
+                "title": track["title"],
+                "filename": sanitize_name(track["title"], track["number"]),
+                "start_frame": track["start_frame"],
+                "end_frame": track["end_frame"],
+            }
+            for track in planned
+        ]
+
+        entries.append(
+            {
+                "tracks": tracks,
+                "track_count": len(tracks),
+                "total_frames": audio_len,
+            }
+        )
+        batch_track_count += len(tracks)
+
+    return {
+        "cues": entries,
+        "cue_count": len(entries),
+        "track_count": batch_track_count,
+        "total_frames": audio_len,
+    }
